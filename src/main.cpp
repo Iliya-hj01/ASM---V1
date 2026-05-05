@@ -54,18 +54,18 @@ struct Stage {
 #define NUM_STAGES 5
 Stage sequence[NUM_STAGES] = {
   // risePos, riseSpd, spinSpd, spinDir, tiltPos, tiltSpd, duration
-  {200, 120, 100, HIGH, 5000,  50, 10000},
-  {400, 120, 150, HIGH, 10000, 50, 10000},
-  {600, 120, 100, HIGH, 5000,  50, 10000},
-  {300, 120, 150, HIGH, 3000,  50, 10000},
-  {200, 120, 100, HIGH, 5000,  50, 10000},
+  {600, 120, 0, HIGH, 12000,  100, 5000},
+  {600, 70, 150, HIGH, 12000, 100, 5000},
+  {350, 70, 100, HIGH, 12000,  100, 5000},
+  {300, 70, 150, HIGH, 12000,  100, 5000},
+  {200, 70, 100, HIGH, 500,  100, 5000},
 };
 
 // ======= Global State =======
 bool isHomed = false;
 volatile long encoderCount = 0;
 bool tiltCurrentDirection = HIGH;
-long tiltPositionGap = 5;  // encoder dead-band
+long tiltPositionGap = 50;  // encoder dead-band
 
 //New functions
 void moveTilt(uint8_t tiltSpeedMove, bool tiltDirectionMove){
@@ -79,8 +79,9 @@ void moveTilt(uint8_t tiltSpeedMove, bool tiltDirectionMove){
 }
 
 void stopTilt(){
-  analogWrite(tiltMotorPWM,0);
-  digitalWrite(tiltMotorIN2,LOW);
+  // Active brake: drive both H-bridge inputs HIGH to short the motor terminals.
+  digitalWrite(tiltMotorIN2, HIGH);
+  analogWrite(tiltMotorPWM, 255);
 }
 
 void stopRise(){
@@ -157,38 +158,63 @@ bool tiltPositionCheck(long targetPos) {
   return (diff < tiltPositionGap) && (diff > -tiltPositionGap);
 }
 
+// ======= Tilt approach tuning =======
+long tiltSlowZone = 800;     // counts before target where we begin slowing down
+uint8_t tiltMinSpeed = 30;   // minimum PWM near the target
+
+// Gravity compensation: in the direction gravity assists, PWM ramping doesn't
+// slow the load (motor freewheels / regenerates). Engage the brake early so
+// the load has room to decelerate against gravity before reaching the target.
+// `tiltGravityDecreasesCount` = true means gravity pulls encoderCount downward
+// (toward 0). Set false if gravity pulls counts upward instead.
+bool tiltGravityDecreasesCount = true;
+long tiltBrakeEarlyGravity = 250;  // counts before target to brake in gravity dir
+
 void moveTiltToPosition(uint8_t speed, long targetPos) {
   long diff = encoderCount - targetPos;
+  long absDiff = diff < 0 ? -diff : diff;
+
   if (tiltPositionCheck(targetPos)) {
     stopTilt();
-  } else if (diff > 0) {
+    return;
+  }
+
+  bool needToDecrease = (diff > 0);
+  bool gravityAssisted = (needToDecrease == tiltGravityDecreasesCount);
+
+  // In the gravity-assisted direction, PWM ramping is ineffective (gravity
+  // overdrives the motor). Brake early and let the load coast to the target.
+  if (gravityAssisted && absDiff < tiltBrakeEarlyGravity) {
+    stopTilt();
+    return;
+  }
+
+  // Linear ramp: full `speed` outside slow zone, down to tiltMinSpeed at target.
+  uint8_t effSpeed = speed;
+  if (speed > tiltMinSpeed && absDiff < tiltSlowZone) {
+    effSpeed = tiltMinSpeed +
+               (uint8_t)(((long)(speed - tiltMinSpeed) * absDiff) / tiltSlowZone);
+  }
+
+  if (needToDecrease) {
     // encoder above target → need to decrease → move toward home (HIGH)
     tiltMovingForward = false;
-    moveTilt(speed, HIGH);
+    moveTilt(effSpeed, HIGH);
   } else {
     // encoder below target → need to increase → move forward (LOW)
     tiltMovingForward = true;
-    moveTilt(speed, LOW);
+    moveTilt(effSpeed, LOW);
   }
 }
 
 // ======= Run Sequence =======
 void runSequence() {
   performHoming();
-  Serial.println("--- Sequence start ---");
-  uint32_t seqStart = millis();
   for (uint8_t i = 0; i < NUM_STAGES; i++) {
     Stage &s = sequence[i];
     uint32_t stageStart = millis();
     bool riseReached = false;
     bool tiltReached = false;
-
-    Serial.print("Stage ");
-    Serial.print(i);
-    Serial.print(" start | rise: ");
-    Serial.print(analogRead(riseActuatorPot));
-    Serial.print(" tilt: ");
-    Serial.println(encoderCount);
 
     moveSpin(s.spinSpeed, s.spinDirection);
 
@@ -218,29 +244,14 @@ void runSequence() {
 
       // Duration expired during movement — skip to next stage
       if (millis() - stageStart >= s.duration) {
-        riseReached = false; // mark as not reached for end print
         break;
       }
     }
-
-    Serial.print("Stage ");
-    Serial.print(i);
-    Serial.print(" end (");
-    Serial.print(millis() - stageStart);
-    Serial.print("ms) rise: ");
-    Serial.print(analogRead(riseActuatorPot));
-    Serial.print(" tilt: ");
-    Serial.print(encoderCount);
-    Serial.print(" - ");
-    Serial.println(riseReached && tiltReached ? "REACHED" : "TIMEOUT");
   }
 
   stopTilt();
   stopRise();
   stopSpin();
-  Serial.print("--- Sequence done (");
-  Serial.print(millis() - seqStart);
-  Serial.println("ms) ---");
 }
 
 // ======= Tilt Button Test =======
@@ -249,8 +260,6 @@ bool lastButtonState = HIGH;
 uint32_t lastDebounceTime = 0;
 const uint32_t debounceDelay = 200;
 
-uint32_t lastPrintTime = 0;
-
 void tiltButtonTest(uint8_t tiltSpeed = 1) {
   bool buttonState = digitalRead(externalButton);
 
@@ -258,8 +267,6 @@ void tiltButtonTest(uint8_t tiltSpeed = 1) {
   if (buttonState == LOW && lastButtonState == HIGH && (millis() - lastDebounceTime) > debounceDelay) {
     tiltDirection = !tiltDirection;
     lastDebounceTime = millis();
-    Serial.print("Direction changed to: ");
-    Serial.println(tiltDirection ? "HIGH" : "LOW");
   }
   lastButtonState = buttonState;
 
@@ -267,20 +274,12 @@ void tiltButtonTest(uint8_t tiltSpeed = 1) {
   // (tiltDirection HIGH = reversed in moveTilt(), so forward = !tiltDirection)
   tiltMovingForward = !tiltDirection;
   moveTilt(tiltSpeed, tiltDirection);
-
-  // Encoder counting handled by INT1 ISR (tiltEncoderISR)
-  if (millis() - lastPrintTime >= 1000) {
-    Serial.print("Encoder: ");
-    Serial.println(encoderCount);
-    lastPrintTime = millis();
-  }
 }
 
 // ======= Spin Motor Test =======
 bool spinDirection = HIGH;
 bool spinLastButtonState = HIGH;
 uint32_t spinLastDebounceTime = 0;
-uint32_t spinLastPrintTime = 0;
 
 void spinMotorTest(uint8_t spinSpeed = 150) {
   bool buttonState = digitalRead(externalButton);
@@ -288,74 +287,39 @@ void spinMotorTest(uint8_t spinSpeed = 150) {
   if (buttonState == LOW && spinLastButtonState == HIGH && (millis() - spinLastDebounceTime) > debounceDelay) {
     spinDirection = !spinDirection;
     spinLastDebounceTime = millis();
-    Serial.print("Spin direction changed to: ");
-    Serial.println(spinDirection ? "CCW" : "CW");
   }
   spinLastButtonState = buttonState;
 
   moveSpin(spinSpeed, spinDirection);
-
-  if (millis() - spinLastPrintTime >= 1000) {
-    Serial.print("Spin running at PWM ");
-    Serial.print(spinSpeed);
-    Serial.print("  dir: ");
-    Serial.println(spinDirection ? "CCW" : "CW");
-    spinLastPrintTime = millis();
-  }
 }
 
 // ======= Rise Direction Pre-Test =======
 bool risePreTestDone = false;
 
 void riseDirectionPreTest(uint8_t testSpeed = 120, uint32_t testDuration = 2000) {
-  int posBefore, posAfter;
-
   // --- Test direction HIGH ---
-  posBefore = analogRead(riseActuatorPot);
-  Serial.print("Testing dir HIGH... start pos: ");
-  Serial.println(posBefore);
   uint32_t t0 = millis();
   while (millis() - t0 < testDuration) {
     moveRise(testSpeed, HIGH);
   }
   stopRise();
   delay(200);
-  posAfter = analogRead(riseActuatorPot);
-  Serial.print("Dir HIGH end pos: ");
-  Serial.print(posAfter);
-  Serial.print("  delta: ");
-  Serial.println(posAfter - posBefore);
 
   // --- Test direction LOW ---
-  posBefore = analogRead(riseActuatorPot);
-  Serial.print("Testing dir LOW... start pos: ");
-  Serial.println(posBefore);
   t0 = millis();
   while (millis() - t0 < testDuration) {
     moveRise(testSpeed, LOW);
   }
   stopRise();
   delay(200);
-  posAfter = analogRead(riseActuatorPot);
-  Serial.print("Dir LOW end pos: ");
-  Serial.print(posAfter);
-  Serial.print("  delta: ");
-  Serial.println(posAfter - posBefore);
 
-  Serial.println("--- Pre-test done. Check deltas above. ---");
-  Serial.println("HIGH delta should be positive (pos increases).");
-  Serial.println("LOW delta should be negative (pos decreases).");
-  Serial.println("If reversed, swap HIGH/LOW in moveRiseToPosition().");
   risePreTestDone = true;
 }
 
 // ======= Rise Actuator Test =======
 bool riseTestMovingUp = true;
-uint32_t riseLastPrintTime = 0;
 
 void riseActuatorTest(uint8_t riseTestSpeed = 50) {
-  int pos = analogRead(riseActuatorPot);
-
   // Switch direction at limits
   if (riseTestMovingUp && risePositionCheck(riseLimitHigh)) {
     riseTestMovingUp = false;
@@ -364,73 +328,78 @@ void riseActuatorTest(uint8_t riseTestSpeed = 50) {
   }
 
   moveRiseToPosition(riseTestSpeed, riseTestMovingUp ? riseLimitHigh : riseLimitLow);
-
-  if (millis() - riseLastPrintTime >= 1000) {
-    Serial.print("Rise pos: ");
-    Serial.print(pos);
-    Serial.print("  target: ");
-    Serial.print(riseTestMovingUp ? riseLimitHigh : riseLimitLow);
-    Serial.print("  dir: ");
-    Serial.println(riseTestMovingUp ? "UP" : "DOWN");
-    riseLastPrintTime = millis();
-  }
 }
 
 // ======= Tilt Actuator Test =======
 bool tiltTestMovingUp = true;
-uint32_t tiltTestLastPrintTime = 0;
 
-void tiltActuatorTest(uint8_t tiltTestSpeed = 200) {
+void tiltActuatorTest(uint8_t tiltTestSpeed = 150) {
+  static bool tiltResting = false;
+  static uint32_t tiltRestStart = 0;
+
   pollEncoder();
 
-  // Switch direction at limits
+  if (tiltResting) {
+    stopTilt();
+    if (millis() - tiltRestStart >= 3000) {
+      tiltResting = false;
+    }
+    return;
+  }
+
+  // Switch direction at limits; begin 3-second rest
   if (tiltTestMovingUp && tiltPositionCheck(tiltLimitHigh)) {
     tiltTestMovingUp = false;
+    stopTilt();
+    tiltResting = true;
+    tiltRestStart = millis();
+    return;
   } else if (!tiltTestMovingUp && tiltPositionCheck(tiltLimitLow)) {
     tiltTestMovingUp = true;
+    stopTilt();
+    tiltResting = true;
+    tiltRestStart = millis();
+    return;
   }
 
   long target = tiltTestMovingUp ? tiltLimitHigh : tiltLimitLow;
   moveTiltToPosition(tiltTestSpeed, target);
-
-  if (millis() - tiltTestLastPrintTime >= 100) {
-    Serial.print("Tilt pos: ");
-    Serial.print(encoderCount);
-    Serial.print("  target: ");
-    Serial.print(target);
-    Serial.print("  motorDir: ");
-    Serial.print(tiltMovingForward ? "FWD" : "HOME");
-    Serial.print("  dir: ");
-    Serial.println(tiltTestMovingUp ? "UP" : "DOWN");
-    tiltTestLastPrintTime = millis();
-  }
 }
 
 // ======= Tilt Direction Test =======
-uint32_t tiltDirTestLastPrintTime = 0;
-
 void tiltDirectionTest(uint8_t speed = 150) {
   pollEncoder();
   tiltMovingForward = true;
   moveTilt(speed, LOW);
-
-  if (millis() - tiltDirTestLastPrintTime >= 500) {
-    Serial.print("Tilt dir LOW | encoder: ");
-    Serial.println(encoderCount);
-    tiltDirTestLastPrintTime = millis();
-  }
 }
 
 // ======= Tilt Home Switch Test =======
-uint32_t tiltSwLastPrintTime = 0;
-
 void tiltHomeSwitchTest() {
-  if (millis() - tiltSwLastPrintTime >= 500) {
-    bool state = digitalRead(tiltHomeSW);
-    Serial.print("Tilt home switch: ");
-    Serial.println(state == HIGH ? "ENGAGED" : "OPEN");
-    tiltSwLastPrintTime = millis();
-  }
+  // No-op: state is reported by printState()
+}
+
+// ======= State Printing =======
+uint32_t printStateInterval = 500; // ms; configurable
+uint32_t printStateLastTime = 0;
+
+void printState() {
+  if (millis() - printStateLastTime < printStateInterval) return;
+  printStateLastTime = millis();
+
+  Serial.print("t=");
+  Serial.print(millis());
+  Serial.print(" tilt=");
+  Serial.print(encoderCount);
+  Serial.print(" tiltFwd=");
+  Serial.print(tiltMovingForward ? 1 : 0);
+  Serial.print(" rise=");
+  Serial.print(analogRead(riseActuatorPot));
+  Serial.print(" homeSW=");
+  Serial.print(digitalRead(tiltHomeSW) == HIGH ? "ENG" : "OPEN");
+  Serial.print(" btn=");
+  Serial.print(digitalRead(externalButton) == LOW ? "DOWN" : "UP");
+  Serial.print(" homed=");
+  Serial.println(isHomed ? 1 : 0);
 }
 
 // ======= Homing =======
@@ -440,7 +409,6 @@ bool performHoming(uint8_t tiltPwm = 200, uint8_t risePwm = 110) {
   bool tiltHomed = false;
   bool riseHomed = false;
 
-  Serial.println("Homing...");
   uint32_t t0 = millis();
 
   while (millis() - t0 < timeoutDuration) {
@@ -450,7 +418,6 @@ bool performHoming(uint8_t tiltPwm = 200, uint8_t risePwm = 110) {
         stopTilt();
         encoderCount = 0;  // reset encoder origin
         tiltHomed = true;
-        Serial.println("Tilt homed.");
       } else {
         moveTilt(tiltPwm, tiltDirectionHoming);
       }
@@ -462,7 +429,6 @@ bool performHoming(uint8_t tiltPwm = 200, uint8_t risePwm = 110) {
       riseHomed = risePositionCheck(riseLimitLow);
       if (riseHomed) {
         stopRise();
-        Serial.println("Rise homed.");
       }
     }
 
@@ -475,13 +441,11 @@ bool performHoming(uint8_t tiltPwm = 200, uint8_t risePwm = 110) {
   stopRise();
 
   if (!tiltHomed || !riseHomed) {
-    Serial.println("Homing TIMEOUT!");
     isHomed = false;
     return false;
   }
 
   isHomed = true;
-  Serial.println("Homing complete.");
   return true;
 }
 
@@ -519,7 +483,8 @@ void loop() {
   }
   seqLastButtonState = btnState;
   // tiltDirectionTest();
-  tiltActuatorTest();
+  // tiltActuatorTest();
   //riseActuatorTest();
   // tiltHomeSwitchTest();
+  printState();
 }
